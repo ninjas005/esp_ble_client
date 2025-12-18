@@ -1,3 +1,7 @@
+// ================================================================
+// ESP32 IoT Firmware
+// ================================================================
+
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <WiFi.h>
@@ -7,22 +11,67 @@
 #include <WiFiClientSecure.h>
 #include <time.h>
 #include <ModbusMaster.h>
+#include <SD.h>
+#include <SPI.h>
+#include <FS.h>
 
+// ================================================================
+// CONSTANTS & CONFIGURATION
+// ================================================================
 #define SERVICE_UUID        "204fefb3-3d9b-4e3f-8f76-8245e29ac6e9"
 #define CHAR_UUID_WRITE     "c639bc5a-c5fa-48e4-814b-257a2cfc425e"
 #define CHAR_UUID_NOTIFY    "63b05182-23a1-43e7-855b-a85cf8f7b7fb"
+
 #define RX1_PIN 18
 #define TX1_PIN 17
+#define SD_CS_PIN   10   // GP10
+#define SD_MOSI_PIN 11   // GP11
+#define SD_SCK_PIN  12   // GP12
+#define SD_MISO_PIN 13   // GP13
 
+// Timing Constants
+const unsigned long WATCHDOG_TIMEOUT = 60000;
+const unsigned long FILE_CHECK_INTERVAL = 900000; // 15 minutes
+const unsigned long WIFI_RECONNECT_INTERVAL = 10000;
+const unsigned long SD_OPERATION_TIMEOUT = 5000;
+const unsigned long HTTP_TIMEOUT = 5000;
+const int WIFI_CONNECT_ATTEMPTS = 20;
+const int MAX_WIFI_NETWORKS_SAVED = 5;
+const int MAX_SCAN_RESULTS = 15;
+
+// Validation Constants
+const int MIN_UPDATE_INTERVAL = 1;
+const int MAX_UPDATE_INTERVAL = 86400; // 24 hours
+const float MIN_SETPOINT = -9999.0;
+const float MAX_SETPOINT = 9999.0;
+
+// ================================================================
+// GLOBAL OBJECTS
+// ================================================================
 Preferences preferences;
-NimBLECharacteristic* pNotifyCharacteristic = NULL;
+NimBLECharacteristic* pNotifyCharacteristic = nullptr;
 ModbusMaster modbus;
 
+SPIClass sdSPI(FSPI);
+bool sdReady = false;
+
+// ================================================================
+// STATE VARIABLES
+// ================================================================
 bool deviceConnected = false;
 bool triggerWifiScan = false;
 bool wifiConfigReceived = false;
 bool watchdogPaused = false;
 bool forceHttpNow = false;
+
+float setPoint1 = 0.0;
+float setPoint2 = 0.0;
+
+unsigned long lastFileCheckTime = 0;
+unsigned long lastHttpTime = 0;
+unsigned long lastWatchdogTime = 0;
+unsigned long lastWifiCheck = 0;
+int lastClockMinute = -1;
 
 String targetSSID = "";
 String targetPass = "";
@@ -31,14 +80,12 @@ String targetPass = "";
 String DEVICE_ID = "ESP_001";
 String API_URL = "https://cloudbases.in/iot_demo24/Api";
 String NTP_SERVER = "1.in.pool.ntp.org";
-int UPDATE_INTERVAL = 60; // Stored in Seconds
-int UPDATE_MODE = 0;      // 0 = Interval (Timer), 1 = Clock Aligned (Cron)
+int UPDATE_INTERVAL = 60;
+int UPDATE_MODE = 0;
 
-unsigned long lastHttpTime = 0;
-unsigned long lastWatchdogTime = 0;
-int lastClockMinute = -1; // To prevent double sending in the same minute
-const unsigned long WATCHDOG_TIMEOUT = 10000;
-
+// ================================================================
+// MODBUS ADDRESS ENUM
+// ================================================================
 typedef enum {
     PROCESS_VALUE = 0,
     DECIMAL_POINT = 1,
@@ -48,24 +95,203 @@ typedef enum {
     HIGH_ALARM_STATUS = 5
 } SensorAddress;
 
-// ----------------------------------------------------------------
-// HELPERS
-// ----------------------------------------------------------------
+// ================================================================
+// HELPER FUNCTIONS
+// ================================================================
+
+void safeNotify(const String& message) {
+    if (deviceConnected && pNotifyCharacteristic != nullptr) {
+        pNotifyCharacteristic->setValue(message);
+        pNotifyCharacteristic->notify();
+    }
+}
+
+bool validateInterval(int interval) {
+    return (interval >= MIN_UPDATE_INTERVAL && interval <= MAX_UPDATE_INTERVAL);
+}
+
+bool validateSetpoint(float value) {
+    return (value >= MIN_SETPOINT && value <= MAX_SETPOINT);
+}
+
+// void setupSD() {
+//     Serial.print(">> SD: Initializing... ");
+
+//     SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+
+//     if (!SD.begin(SD_CS_PIN, SPI)) {
+//         Serial.println("Failed!");
+//     } else {
+//         Serial.println("Success.");
+//     }
+// }
+
+void setupSD() {
+    Serial.print(">> SD: Initializing... ");
+
+    sdSPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+
+    if (!SD.begin(SD_CS_PIN, sdSPI, 4000000)) { // 4 MHz = stable
+        Serial.println("Failed");
+        sdReady = false;
+        return;
+    }
+
+    if (SD.cardType() == CARD_NONE) {
+        Serial.println("No card");
+        sdReady = false;
+        return;
+    }
+
+    sdReady = true;
+    Serial.println("OK");
+}
+
+
+bool saveDataOffline(const String& timestamp, const String& sensorData) {
+    if (!sdReady) {
+        Serial.println(">> SD: Not ready");
+        return false;
+    }
+
+    unsigned long start = millis();
+
+    String filename = "/" + timestamp;
+    filename.replace(" ", "");
+    filename.replace("-", "");
+    filename.replace(":", "");
+    filename += ".txt";
+
+    File file = SD.open(filename, FILE_WRITE);
+    if (!file) {
+        Serial.println(">> SD: Open failed");
+        return false;
+    }
+
+    file.print(timestamp);
+    file.print(",");
+    file.print(sensorData);
+    file.print("\n");
+    file.close();
+
+    if (millis() - start > SD_OPERATION_TIMEOUT) {
+        Serial.println(">> SD: Write timeout");
+        return false;
+    }
+
+    Serial.println(">> SD: Saved -> " + filename);
+    return true;
+}
+
+void processOfflineFiles() {
+    if (!sdReady || WiFi.status() != WL_CONNECTED) return;
+
+    unsigned long start = millis();
+
+    File root = SD.open("/");
+    if (!root) return;
+
+    int processed = 0;
+    const int MAX_FILES = 5;
+
+    while (processed < MAX_FILES) {
+        File file = root.openNextFile();
+        if (!file) break;
+
+        if (millis() - start > SD_OPERATION_TIMEOUT) {
+            Serial.println(">> SD: Processing timeout");
+            file.close();
+            break;
+        }
+
+        String filename = file.name();
+        if (!filename.endsWith(".txt")) {
+            file.close();
+            continue;
+        }
+
+        String content = file.readStringUntil('\n');
+        file.close();
+
+        int comma = content.indexOf(',');
+        if (comma < 0) {
+            SD.remove(filename);
+            continue;
+        }
+
+        String ts  = content.substring(0, comma);
+        String val = content.substring(comma + 1);
+
+        String url = API_URL +
+            "?device_code=" + DEVICE_ID +
+            "&field1=" + val +
+            "&timestamp=" + ts;
+
+        url.replace(" ", "%20");
+
+        WiFiClientSecure client;
+        client.setInsecure();
+
+        HTTPClient http;
+        http.begin(client, url);
+        http.setTimeout(HTTP_TIMEOUT);
+
+        int code = http.GET();
+        String resp = http.getString();
+        http.end();
+
+        if (code == 200 && resp.indexOf("true") >= 0) {
+            SD.remove(filename);
+            Serial.println(">> SD: Uploaded & deleted " + filename);
+            processed++;
+        } else {
+            Serial.println(">> SD: Upload failed, retry later");
+            break;
+        }
+
+        yield();
+    }
+
+    root.close();
+}
+
+
 void loadConfig() {
     preferences.begin("app_conf", true);
-    if(preferences.isKey("data")) {
+    if (preferences.isKey("data")) {
         String json = preferences.getString("data", "{}");
         JsonDocument doc;
-        deserializeJson(doc, json);
-        
-        if(doc.containsKey("id")) DEVICE_ID = doc["id"].as<String>();
-        if(doc.containsKey("url")) API_URL = doc["url"].as<String>();
-        if(doc.containsKey("ntp")) NTP_SERVER = doc["ntp"].as<String>();
-        if(doc.containsKey("int")) UPDATE_INTERVAL = doc["int"].as<int>();
-        if(doc.containsKey("mode")) UPDATE_MODE = doc["mode"].as<int>();
-        
-        if(UPDATE_INTERVAL < 10) UPDATE_INTERVAL = 10; 
-        Serial.println(">> CONFIG: Loaded.");
+        DeserializationError error = deserializeJson(doc, json);
+
+        if (!error) {
+            if (doc.containsKey("id")) DEVICE_ID = doc["id"].as<String>();
+            if (doc.containsKey("url")) API_URL = doc["url"].as<String>();
+            if (doc.containsKey("ntp")) NTP_SERVER = doc["ntp"].as<String>();
+
+            if (doc.containsKey("int")) {
+                int interval = doc["int"].as<int>();
+                UPDATE_INTERVAL = validateInterval(interval) ? interval : 60;
+            }
+
+            if (doc.containsKey("mode")) {
+                UPDATE_MODE = doc["mode"].as<int>();
+                UPDATE_MODE = (UPDATE_MODE == 0 || UPDATE_MODE == 1) ? UPDATE_MODE : 0;
+            }
+
+            if (doc.containsKey("sp1")) {
+                float sp1 = doc["sp1"].as<float>();
+                setPoint1 = validateSetpoint(sp1) ? sp1 : 0.0;
+            }
+
+            if (doc.containsKey("sp2")) {
+                float sp2 = doc["sp2"].as<float>();
+                setPoint2 = validateSetpoint(sp2) ? sp2 : 0.0;
+            }
+
+            Serial.println(">> CONFIG: Loaded and validated.");
+        } else {
+            Serial.println(">> CONFIG: JSON parse error");
+        }
     }
     preferences.end();
 }
@@ -78,6 +304,9 @@ void saveConfig() {
     doc["ntp"] = NTP_SERVER;
     doc["int"] = UPDATE_INTERVAL;
     doc["mode"] = UPDATE_MODE;
+    doc["sp1"] = setPoint1;
+    doc["sp2"] = setPoint2;
+
     String output;
     serializeJson(doc, output);
     preferences.putString("data", output);
@@ -85,24 +314,33 @@ void saveConfig() {
     Serial.println(">> CONFIG: Saved to NVS.");
 }
 
-void saveNetworkToMemory(String ssid, String pass) {
-    if(ssid.length() == 0) return;
+void saveNetworkToMemory(const String& ssid, const String& pass) {
+    if (ssid.length() == 0) return;
+
     preferences.begin("wifi_db", false);
     String currentData = preferences.getString("nets", "[]");
     JsonDocument doc;
     deserializeJson(doc, currentData);
     JsonArray array = doc.as<JsonArray>();
+
     bool found = false;
     for (JsonObject obj : array) {
         if (obj["s"] == ssid) {
-            obj["p"] = pass; found = true; break;
+            obj["p"] = pass;
+            found = true;
+            break;
         }
     }
+
     if (!found) {
-        while (array.size() >= 5) array.remove(0);
+        while (array.size() >= MAX_WIFI_NETWORKS_SAVED) {
+            array.remove(0);
+        }
         JsonObject newObj = array.add<JsonObject>();
-        newObj["s"] = ssid; newObj["p"] = pass;
+        newObj["s"] = ssid;
+        newObj["p"] = pass;
     }
+
     String output;
     serializeJson(doc, output);
     preferences.putString("nets", output);
@@ -130,11 +368,15 @@ bool tryAutoConnect() {
                 String savedPass = obj["p"].as<String>();
                 Serial.printf(">> AUTO: Connecting to %s\n", currentSSID.c_str());
                 WiFi.begin(currentSSID.c_str(), savedPass.c_str());
+
                 int attempts = 0;
-                while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-                    delay(500); Serial.print("."); attempts++;
+                while (WiFi.status() != WL_CONNECTED && attempts < WIFI_CONNECT_ATTEMPTS) {
+                    delay(500);
+                    Serial.print(".");
+                    attempts++;
                 }
                 Serial.println();
+
                 if (WiFi.status() == WL_CONNECTED) return true;
             }
         }
@@ -142,92 +384,109 @@ bool tryAutoConnect() {
     return false;
 }
 
-// ----------------------------------------------------------------
-// HTTP & SENSOR
-// ----------------------------------------------------------------
 void setupTime() {
     configTime(0, 0, NTP_SERVER.c_str());
     Serial.println(">> TIME: Syncing...");
 }
 
-
 void setupModbus() {
-    modbus.begin(1, Serial1);  // Slave ID 1 on Serial1
-    // modbus.BaudRate(9600);     // Set baud rate
-    Serial.println(">> MODBUS: Initialized");
+    Serial1.begin(9600, SERIAL_8N1, RX1_PIN, TX1_PIN);
+    modbus.begin(1, Serial1);
+    Serial.println(">> MODBUS: Initialized (9600 baud)");
 }
-
 
 uint8_t writeModbusRegister(uint16_t reg, uint16_t value) {
     uint8_t wResult = modbus.writeSingleRegister(reg, value);
     if (wResult == modbus.ku8MBSuccess) {
-        Serial.println(">> MODBUS: write OK");
+        Serial.println(">> MODBUS: Write OK");
         return 1;
     } else {
-        Serial.printf(">> MODBUS: write error: %02X\n", wResult);
+        Serial.printf(">> MODBUS: Write error: %02X\n", wResult);
         return 0;
     }
-}   
-
+}
 
 void sendSensorData() {
-    if (WiFi.status() != WL_CONNECTED) return;
+    // if (WiFi.status() != WL_CONNECTED) {
+    //     Serial.println(">> SKIP: WiFi not connected");
+    //     return;
+    // }
 
-    String sensorData = "0";
-    
-    // Read sensor data via Modbus
-    uint8_t result = modbus.readHoldingRegisters(PROCESS_VALUE, 2);         // Read 2 registers from address 40001
+    // Read sensor via Modbus
+    String sensorData = "";
+    uint8_t result = modbus.readHoldingRegisters(PROCESS_VALUE, 2);
+
     if (result == modbus.ku8MBSuccess) {
-        uint16_t sensorValue = modbus.getResponseBuffer(0);     // First register 40001
-        uint16_t decimal = modbus.getResponseBuffer(1);         // Second register 40002 (if needed)
+        uint16_t sensorValue = modbus.getResponseBuffer(0);
         sensorData = String(sensorValue);
         Serial.println(">> SENSOR: " + sensorData + " (Modbus)");
     } else {
-        Serial.printf(">> MODBUS: Error reading sensor (Error: %02X)\n", result);
+        Serial.printf(">> MODBUS: Read error: %02X\n", result);
     }
 
-    if (sensorData == "" || sensorData == "0") return;
+    // Validate sensor data
+    if (sensorData.isEmpty()) {
+        Serial.println(">> SKIP: No valid sensor data");
 
-    lastWatchdogTime = millis(); 
+        // UNCOMMENT FOR TESTING WITH DUMMY DATA:
+        // sensorData = "99.9";
+        // Serial.println(">> TEST MODE: Using dummy data");
 
+        if (sensorData.isEmpty()) {
+            return; // Exit if no valid data
+        }
+    }
+
+    lastWatchdogTime = millis();
+
+    // Get timestamp
     time_t now;
     time(&now);
-    
-    // Debug print time
     struct tm timeinfo;
-    if(getLocalTime(&timeinfo)){
-        Serial.printf(">> TIME: %02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min);
-    }
-    
-    String fullUrl = API_URL + "?device_code=" + DEVICE_ID + "&field1=" + sensorData + "&timestamp=" + String(now);
-    
-    Serial.println(">> HTTP: Sending data...");
+    localtime_r(&now, &timeinfo);
+    char timeStr[25];
+    strftime(timeStr, sizeof(timeStr), "%Y%m%d %H%M%S", &timeinfo);
 
+    // Build URL
+    String fullUrl = API_URL + "?device_code=" + DEVICE_ID + 
+                    "&field1=" + sensorData + "&timestamp=" + String(timeStr);
+    fullUrl.replace(" ", "%20");
+
+    // Send HTTP request
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(5000); 
+    client.setTimeout(HTTP_TIMEOUT / 1000);
 
     HTTPClient http;
     http.begin(client, fullUrl);
+    http.setTimeout(HTTP_TIMEOUT);
+
     int httpResponseCode = http.GET();
-    
-    if (httpResponseCode > 0) {
-        Serial.printf(">> HTTP: Success (%d)\n", httpResponseCode);
-    } else {
-        Serial.printf(">> HTTP: Failed (%s)\n", http.errorToString(httpResponseCode).c_str());
-    }
+    String response = http.getString();
     http.end();
+
+    Serial.printf(">> HTTP: Status %d\n", httpResponseCode);
+    Serial.println(">> HTTP: Body: " + response);
+
+    // Check success and fallback to SD if failed
+    if (httpResponseCode == 200 && response.indexOf("true") >= 0) {
+        Serial.println(">> HTTP: Success");
+    } else {
+        Serial.println(">> HTTP: Failed. Saving to SD...");
+        saveDataOffline(String(timeStr), sensorData);
+    }
 }
 
-// ----------------------------------------------------------------
-// CALLBACKS
-// ----------------------------------------------------------------
+// ================================================================
+// BLE CALLBACKS
+// ================================================================
 class MyServerCallbacks: public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* pServer) {
         deviceConnected = true;
         lastWatchdogTime = millis();
         Serial.println(">> EVENT: Phone Connected");
-    };
+    }
+
     void onDisconnect(NimBLEServer* pServer) {
         deviceConnected = false;
         Serial.println(">> EVENT: Phone Disconnected");
@@ -238,162 +497,239 @@ class MyServerCallbacks: public NimBLEServerCallbacks {
 class MyCallbacks: public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *pCharacteristic) {
         std::string value = pCharacteristic->getValue();
-        if (value.length() > 0) {
-            lastWatchdogTime = millis();
-            
-            Serial.print(">> RAW BLE: ");
-            Serial.println(value.c_str());
+        if (value.length() == 0) return;
 
-            JsonDocument doc;
-            DeserializationError error = deserializeJson(doc, value);
-            
-            if (!error) {
-                if (doc.containsKey("action")) {
-                    const char* act = doc["action"];
-                    if (strcmp(act, "scan") == 0) triggerWifiScan = true;
-                    else if (strcmp(act, "get_conf") == 0) {
-                         JsonDocument resp;
-                         resp["id"] = DEVICE_ID;
-                         resp["url"] = API_URL;
-                         resp["ntp"] = NTP_SERVER;
-                         resp["int"] = UPDATE_INTERVAL;
-                         resp["mode"] = UPDATE_MODE;
-                         String out;
-                         serializeJson(resp, out);
-                         if(deviceConnected) {
-                             pNotifyCharacteristic->setValue(out);
-                             pNotifyCharacteristic->notify();
-                         }
-                    }
-                    else if (strcmp(act, "get_status") == 0) {
-                         String statusMsg = "Status: Not Connected";
-                         if (WiFi.status() == WL_CONNECTED) statusMsg = "Connected! SSID: " + WiFi.SSID() + " | IP: " + WiFi.localIP().toString();
-                         if(deviceConnected) { pNotifyCharacteristic->setValue(statusMsg); pNotifyCharacteristic->notify(); }
-                    }
+        lastWatchdogTime = millis();
+        Serial.print(">> RAW BLE: ");
+        Serial.println(value.c_str());
+
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, value);
+
+        if (error) {
+            Serial.println(">> BLE: JSON parse error");
+            return;
+        }
+
+        // Handle actions
+        if (doc.containsKey("action")) {
+            const char* act = doc["action"];
+
+            if (strcmp(act, "scan") == 0) {
+                triggerWifiScan = true;
+            }
+            else if (strcmp(act, "get_conf") == 0) {
+                JsonDocument resp;
+                resp["id"] = DEVICE_ID;
+                resp["url"] = API_URL;
+                resp["ntp"] = NTP_SERVER;
+                resp["int"] = UPDATE_INTERVAL;
+                resp["mode"] = UPDATE_MODE;
+                resp["sp1"] = setPoint1;
+                resp["sp2"] = setPoint2;
+
+                String out;
+                serializeJson(resp, out);
+                safeNotify(out);
+            }
+            else if (strcmp(act, "get_status") == 0) {
+                String statusMsg = WiFi.status() == WL_CONNECTED 
+                    ? "Connected! SSID: " + WiFi.SSID() + " | IP: " + WiFi.localIP().toString()
+                    : "Status: Not Connected";
+                safeNotify(statusMsg);
+            }
+        }
+        // Handle config updates
+        else if (doc.containsKey("id") || doc.containsKey("url") || 
+                 doc.containsKey("ntp") || doc.containsKey("int") || 
+                 doc.containsKey("mode") || doc.containsKey("sp1") || 
+                 doc.containsKey("sp2")) {
+
+            bool changed = false;
+
+            if (doc.containsKey("id")) {
+                DEVICE_ID = doc["id"].as<String>();
+                changed = true;
+            }
+            if (doc.containsKey("url")) {
+                API_URL = doc["url"].as<String>();
+                changed = true;
+            }
+            if (doc.containsKey("ntp")) {
+                NTP_SERVER = doc["ntp"].as<String>();
+                changed = true;
+            }
+            if (doc.containsKey("int")) {
+                int interval = doc["int"].as<int>();
+                if (validateInterval(interval)) {
+                    UPDATE_INTERVAL = interval;
+                    changed = true;
+                } else {
+                    safeNotify("Error: Invalid interval (1-86400)");
                 }
-                // UPDATE CONFIG
-                else if (doc.containsKey("id") || doc.containsKey("url") || doc.containsKey("ntp") || doc.containsKey("int") || doc.containsKey("mode")) {
-                    bool changed = false;
-                    if(doc.containsKey("id")) { DEVICE_ID = doc["id"].as<String>(); changed = true; }
-                    if(doc.containsKey("url")) { API_URL = doc["url"].as<String>(); changed = true; }
-                    if(doc.containsKey("ntp")) { NTP_SERVER = doc["ntp"].as<String>(); changed = true; }
-                    if(doc.containsKey("int")) { UPDATE_INTERVAL = doc["int"].as<int>(); changed = true; }
-                    if(doc.containsKey("mode")) { UPDATE_MODE = doc["mode"].as<int>(); changed = true; }
-                    
-                    if(changed) {
-                        saveConfig();
-                        forceHttpNow = true; 
-                        if(deviceConnected) {
-                            pNotifyCharacteristic->setValue("Settings Saved.");
-                            pNotifyCharacteristic->notify();
-                        }
-                    }
+            }
+            if (doc.containsKey("mode")) {
+                int mode = doc["mode"].as<int>();
+                if (mode == 0 || mode == 1) {
+                    UPDATE_MODE = mode;
+                    changed = true;
                 }
-                else if (doc.containsKey("ssid")) {
-                    targetSSID = String((const char*)doc["ssid"]);
-                    targetPass = String((const char*)doc["pass"]);
-                    targetSSID.trim(); targetPass.trim();
-                    wifiConfigReceived = true;
+            }
+            if (doc.containsKey("sp1")) {
+                float sp1 = doc["sp1"].as<float>();
+                if (validateSetpoint(sp1)) {
+                    setPoint1 = sp1;
+                    changed = true;
+                } else {
+                    safeNotify("Error: Invalid setpoint 1");
                 }
+            }
+            if (doc.containsKey("sp2")) {
+                float sp2 = doc["sp2"].as<float>();
+                if (validateSetpoint(sp2)) {
+                    setPoint2 = sp2;
+                    changed = true;
+                } else {
+                    safeNotify("Error: Invalid setpoint 2");
+                }
+            }
+
+            if (changed) {
+                saveConfig();
+                forceHttpNow = true;
+                safeNotify("Settings Saved.");
+            }
+        }
+        // Handle WiFi credentials
+        else if (doc.containsKey("ssid")) {
+            targetSSID = String((const char*)doc["ssid"]);
+            targetPass = doc.containsKey("pass") ? String((const char*)doc["pass"]) : "";
+            targetSSID.trim();
+            targetPass.trim();
+
+            if (targetSSID.length() > 0) {
+                wifiConfigReceived = true;
             }
         }
     }
 };
 
-// ----------------------------------------------------------------
+// ================================================================
 // SETUP
-// ----------------------------------------------------------------
+// ================================================================
 void setup() {
     Serial.begin(115200);
-    Serial.setTimeout(50); 
-    Serial1.begin(9600, SERIAL_8N1, RX1_PIN, TX1_PIN);
-    Serial1.setTimeout(50); 
+    Serial.setTimeout(50);
 
-    delay(2000);
-    Serial.println("--- FIRMWARE STARTED ---");
+    setupSD();
+    delay(500);
 
+    Serial.println("\n--- FIRMWARE STARTED (v1.1) ---");
+
+    // Initialize preferences
     preferences.begin("wifi_db", false);
-    if (!preferences.isKey("nets")) preferences.putString("nets", "[]");
+    if (!preferences.isKey("nets")) {
+        preferences.putString("nets", "[]");
+    }
     preferences.end();
-    
-    loadConfig();
 
+    loadConfig();
+    setupModbus();
+
+    // Generate unique device name
     uint64_t mac = ESP.getEfuseMac();
-    uint32_t lowBytes = (uint32_t)mac; 
+    uint32_t lowBytes = (uint32_t)mac;
     String devName = "ESP_Setup_" + String(lowBytes, HEX);
     devName.toUpperCase();
-    Serial.println("Device Name: " + devName);
-    
-    NimBLEDevice::init(devName.c_str()); 
+    Serial.println(">> Device Name: " + devName);
 
+    // Initialize BLE
+    NimBLEDevice::init(devName.c_str());
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     NimBLEDevice::setMTU(250);
 
     NimBLEServer* pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
+
     NimBLEService *pService = pServer->createService(SERVICE_UUID);
-    
+
     NimBLECharacteristic *pWriteCharacteristic = pService->createCharacteristic(
-        CHAR_UUID_WRITE, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+        CHAR_UUID_WRITE,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
     );
     pWriteCharacteristic->setCallbacks(new MyCallbacks());
-    
+
     pNotifyCharacteristic = pService->createCharacteristic(
-        CHAR_UUID_NOTIFY, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+        CHAR_UUID_NOTIFY,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
     );
-    
+
     pService->start();
+
     NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
-    
+
     NimBLEAdvertisementData scanResp;
     scanResp.setName(devName.c_str());
     pAdvertising->setScanResponseData(scanResp);
-    
     pAdvertising->start();
-    
+
     lastWatchdogTime = millis();
 
+    // WiFi setup
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     delay(100);
-    
-    setupModbus();
-    
+
     if (tryAutoConnect()) {
-        Serial.println(">> BOOT: Connected.");
+        Serial.println(">> BOOT: Connected to WiFi");
         setupTime();
+    } else {
+        Serial.println(">> BOOT: No saved networks found");
     }
 }
 
-// ----------------------------------------------------------------
-// LOOP
-// ----------------------------------------------------------------
+// ================================================================
+// MAIN LOOP
+// ================================================================
 void loop() {
-    if (deviceConnected && !watchdogPaused && (millis() - lastWatchdogTime > WATCHDOG_TIMEOUT)) {
-         Serial.println(">> WATCHDOG: App died. Force Disconnect.");
-         NimBLEDevice::getServer()->disconnect(0); 
+    // Watchdog (only when not paused and connected)
+    if (deviceConnected && !watchdogPaused && 
+        (millis() - lastWatchdogTime > WATCHDOG_TIMEOUT)) {
+        Serial.println(">> WATCHDOG: App timeout. Force disconnect.");
+        NimBLEDevice::getServer()->disconnect(0);
     }
 
+    // Process offline files periodically
+    if (WiFi.status() == WL_CONNECTED && 
+        (millis() - lastFileCheckTime > FILE_CHECK_INTERVAL)) {
+        lastFileCheckTime = millis();
+        watchdogPaused = true;
+        processOfflineFiles();
+        watchdogPaused = false;
+        lastWatchdogTime = millis();
+    }
+
+    // Data sending logic
     if (WiFi.status() == WL_CONNECTED) {
-        
         bool shouldTrigger = false;
 
-        // MODE 0: INTERVAL (Standard Timer)
+        // MODE 0: Interval (Timer)
         if (UPDATE_MODE == 0) {
-            if (millis() - lastHttpTime > (UPDATE_INTERVAL * 1000)) {
+            if (millis() - lastHttpTime > (UPDATE_INTERVAL * 1000UL)) {
                 shouldTrigger = true;
                 lastHttpTime = millis();
             }
         }
-        // MODE 1: CLOCK ALIGNED (Cron)
+        // MODE 1: Clock Aligned (Cron)
         else if (UPDATE_MODE == 1) {
             struct tm timeinfo;
             if (getLocalTime(&timeinfo)) {
                 int minInterval = UPDATE_INTERVAL / 60;
                 if (minInterval < 1) minInterval = 1;
 
-                if (timeinfo.tm_min % minInterval == 0 && timeinfo.tm_min != lastClockMinute) {
+                if (timeinfo.tm_min % minInterval == 0 && 
+                    timeinfo.tm_min != lastClockMinute) {
                     shouldTrigger = true;
                     lastClockMinute = timeinfo.tm_min;
                 }
@@ -410,47 +746,126 @@ void loop() {
         }
     }
 
+    // WiFi scan request
     if (triggerWifiScan) {
         triggerWifiScan = false;
-        watchdogPaused = true; 
-        
-        if(deviceConnected) { pNotifyCharacteristic->setValue("Scanning..."); pNotifyCharacteristic->notify(); }
-        
-        WiFi.disconnect(); 
+        watchdogPaused = true;
+
+        safeNotify("Scanning...");
+        WiFi.disconnect();
+
         int n = WiFi.scanNetworks();
-        JsonDocument scanDoc; JsonArray array = scanDoc.to<JsonArray>();
-        for (int i = 0; i < n && i < 15; ++i) { if(WiFi.SSID(i).length() > 0) array.add(WiFi.SSID(i)); }
-        String output; serializeJson(scanDoc, output);
-        if(deviceConnected) { pNotifyCharacteristic->setValue(output); pNotifyCharacteristic->notify(); }
+        JsonDocument scanDoc;
+        JsonArray array = scanDoc.to<JsonArray>();
+
+        for (int i = 0; i < n && i < MAX_SCAN_RESULTS; ++i) {
+            if (WiFi.SSID(i).length() > 0) {
+                array.add(WiFi.SSID(i));
+            }
+        }
+
+        String output;
+        serializeJson(scanDoc, output);
+        safeNotify(output);
+
         WiFi.scanDelete();
-        watchdogPaused = false; lastWatchdogTime = millis(); 
+        watchdogPaused = false;
+        lastWatchdogTime = millis();
     }
 
+    // WiFi connection request
     if (wifiConfigReceived) {
         wifiConfigReceived = false;
         watchdogPaused = true;
-        if(deviceConnected) { pNotifyCharacteristic->setValue("Connecting..."); pNotifyCharacteristic->notify(); }
-        WiFi.disconnect(); WiFi.begin(targetSSID.c_str(), targetPass.c_str());
-        int attempts = 0; while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); Serial.print("."); attempts++; }
+
+        safeNotify("Connecting...");
+        WiFi.disconnect();
+        WiFi.begin(targetSSID.c_str(), targetPass.c_str());
+
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < WIFI_CONNECT_ATTEMPTS) {
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
         Serial.println();
+
         if (WiFi.status() == WL_CONNECTED) {
-            String msg = "Connected! SSID: " + WiFi.SSID() + " | IP: " + WiFi.localIP().toString();
-            Serial.println(msg);
-            if(deviceConnected) { pNotifyCharacteristic->setValue(msg); pNotifyCharacteristic->notify(); }
+            String msg = "Connected! SSID: " + WiFi.SSID() + 
+                        " | IP: " + WiFi.localIP().toString();
+            Serial.println(">> " + msg);
+            safeNotify(msg);
+
             saveNetworkToMemory(targetSSID, targetPass);
             setupTime();
             forceHttpNow = true;
         } else {
-            Serial.println(">> ERROR: Connect Failed");
-            if(deviceConnected) { pNotifyCharacteristic->setValue("Connection Failed."); pNotifyCharacteristic->notify(); }
+            Serial.println(">> ERROR: WiFi connection failed");
+            safeNotify("Connection Failed.");
         }
-        watchdogPaused = false; lastWatchdogTime = millis();
-    }
-    
-    static unsigned long lastWifiCheck = 0;
-    if (WiFi.status() != WL_CONNECTED && !deviceConnected && (millis() - lastWifiCheck > 10000)) {
-        lastWifiCheck = millis(); tryAutoConnect();
+
+        watchdogPaused = false;
+        lastWatchdogTime = millis();
     }
 
-    delay(10); 
+    // Auto-reconnect when disconnected
+    if (WiFi.status() != WL_CONNECTED && !deviceConnected && 
+        (millis() - lastWifiCheck > WIFI_RECONNECT_INTERVAL)) {
+        lastWifiCheck = millis();
+        tryAutoConnect();
+    }
+
+    delay(10);
 }
+
+// #include <Arduino.h>
+// #include <nvs_flash.h>
+// #include <Preferences.h>
+
+// void setup() {
+//     Serial.begin(115200);
+//     delay(2000); // Give time to open monitor
+
+//     Serial.println("\n\n-----------------------------------");
+//     Serial.println("STARTING FULL MEMORY WIPE...");
+//     Serial.println("-----------------------------------");
+
+//     // 1. Erase NVS (Non-Volatile Storage) - Low Level
+//     // This clears Wi-Fi creds, Bluetooth bonds, and generic data
+//     esp_err_t err = nvs_flash_erase();
+//     if (err == ESP_OK) {
+//         Serial.println(">> NVS Flash: ERASED SUCCESSFULLY.");
+//     } else {
+//         Serial.printf(">> NVS Flash: Erase Failed (Error: %s)\n", esp_err_to_name(err));
+//     }
+
+//     // 2. Re-Initialize NVS
+//     err = nvs_flash_init();
+//     if (err == ESP_OK) {
+//         Serial.println(">> NVS Flash: RE-INITIALIZED.");
+//     }
+
+//     // 3. Clear Preferences (High Level wrapper used in your app)
+//     // Specifically targeting the namespaces you used
+//     Preferences preferences;
+    
+//     preferences.begin("app_conf", false);
+//     preferences.clear();
+//     preferences.end();
+//     Serial.println(">> Preferences 'app_conf': CLEARED.");
+
+//     preferences.begin("wifi_db", false);
+//     preferences.clear();
+//     preferences.end();
+//     Serial.println(">> Preferences 'wifi_db': CLEARED.");
+
+//     Serial.println("-----------------------------------");
+//     Serial.println("!!! FACTORY RESET COMPLETE !!!");
+//     Serial.println("You can now upload your main firmware.");
+//     Serial.println("-----------------------------------");
+// }
+
+// void loop() {
+//     // Do nothing
+//     delay(1000);
+// }
