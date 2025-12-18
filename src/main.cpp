@@ -445,7 +445,7 @@ void sendSensorData() {
     struct tm timeinfo;
     localtime_r(&now, &timeinfo);
     char timeStr[25];
-    strftime(timeStr, sizeof(timeStr), "%Y%m%d %H%M%S", &timeinfo);
+    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
 
     // Build URL
     String fullUrl = API_URL + "?device_code=" + DEVICE_ID + 
