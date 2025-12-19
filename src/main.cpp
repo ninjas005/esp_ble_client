@@ -24,7 +24,7 @@
 
 #define RX1_PIN 18
 #define TX1_PIN 17
-#define SD_CS_PIN   10   // GP10
+#define SD_CS_PIN    9   // GP9
 #define SD_MOSI_PIN 11   // GP11
 #define SD_SCK_PIN  12   // GP12
 #define SD_MISO_PIN 13   // GP13
@@ -32,7 +32,7 @@
 // Timing Constants
 const unsigned long WATCHDOG_TIMEOUT = 60000;
 const unsigned long FILE_CHECK_INTERVAL = 900000; // 15 minutes
-const unsigned long WIFI_RECONNECT_INTERVAL = 10000;
+const unsigned long WIFI_RECONNECT_INTERVAL = 60000;
 const unsigned long SD_OPERATION_TIMEOUT = 5000;
 const unsigned long HTTP_TIMEOUT = 5000;
 const int WIFI_CONNECT_ATTEMPTS = 20;
@@ -52,7 +52,7 @@ Preferences preferences;
 NimBLECharacteristic* pNotifyCharacteristic = nullptr;
 ModbusMaster modbus;
 
-SPIClass sdSPI(FSPI);
+SPIClass sdSPI(HSPI);
 bool sdReady = false;
 
 // ================================================================
@@ -114,24 +114,12 @@ bool validateSetpoint(float value) {
     return (value >= MIN_SETPOINT && value <= MAX_SETPOINT);
 }
 
-// void setupSD() {
-//     Serial.print(">> SD: Initializing... ");
-
-//     SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-
-//     if (!SD.begin(SD_CS_PIN, SPI)) {
-//         Serial.println("Failed!");
-//     } else {
-//         Serial.println("Success.");
-//     }
-// }
-
 void setupSD() {
     Serial.print(">> SD: Initializing... ");
 
     sdSPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
 
-    if (!SD.begin(SD_CS_PIN, sdSPI, 4000000)) { // 4 MHz = stable
+    if (!SD.begin(SD_CS_PIN, sdSPI, 1000000)) { // 4 MHz = stable
         Serial.println("Failed");
         sdReady = false;
         return;
@@ -348,45 +336,55 @@ void saveNetworkToMemory(const String& ssid, const String& pass) {
 }
 
 bool tryAutoConnect() {
-    Serial.println(">> AUTO: Scanning...");
-    int n = WiFi.scanNetworks();
-    if (n == 0) return false;
-
+    // 1. Load saved networks
     preferences.begin("wifi_db", true);
     String savedData = preferences.getString("nets", "[]");
     preferences.end();
-    if (savedData == "[]") return false;
+
+    if (savedData == "[]") {
+        Serial.println(">> AUTO: No saved networks.");
+        return false;
+    }
 
     JsonDocument doc;
     deserializeJson(doc, savedData);
     JsonArray savedNets = doc.as<JsonArray>();
 
-    for (int i = 0; i < n; ++i) {
-        String currentSSID = WiFi.SSID(i);
-        for (JsonObject obj : savedNets) {
-            if (obj["s"] == currentSSID) {
-                String savedPass = obj["p"].as<String>();
-                Serial.printf(">> AUTO: Connecting to %s\n", currentSSID.c_str());
-                WiFi.begin(currentSSID.c_str(), savedPass.c_str());
-
-                int attempts = 0;
-                while (WiFi.status() != WL_CONNECTED && attempts < WIFI_CONNECT_ATTEMPTS) {
-                    delay(500);
-                    Serial.print(".");
-                    attempts++;
-                }
-                Serial.println();
-
-                if (WiFi.status() == WL_CONNECTED) return true;
-            }
+    // 2. Iterate and Try Connecting BLINDLY (No Scan)
+    for (JsonObject obj : savedNets) {
+        String ssid = obj["s"].as<String>();
+        String pass = obj["p"].as<String>();
+        
+        Serial.printf(">> AUTO: Trying to connect to [%s]...\n", ssid.c_str());
+        
+        WiFi.disconnect();
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        
+        // Wait up to 5 seconds for connection
+        // This is faster than Scanning (2s) + Connecting (5s)
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 10) { // 5 seconds max
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
+        Serial.println();
+        
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println(">> AUTO: Success! Connected.");
+            return true;
+        } else {
+            Serial.println(">> AUTO: Failed. Trying next...");
         }
     }
+    
+    Serial.println(">> AUTO: Could not connect to any saved network.");
     return false;
 }
 
 void setupTime() {
-    configTime(0, 0, NTP_SERVER.c_str());
-    Serial.println(">> TIME: Syncing...");
+    configTime(19800, 0, NTP_SERVER.c_str()); // IST
+    Serial.println(">> TIME: Syncing (IST)...");
 }
 
 void setupModbus() {
@@ -418,8 +416,10 @@ void sendSensorData() {
 
     if (result == modbus.ku8MBSuccess) {
         uint16_t sensorValue = modbus.getResponseBuffer(0);
+        uint16_t decimalpoint = modbus.getResponseBuffer(1);
         sensorData = String(sensorValue);
         Serial.println(">> SENSOR: " + sensorData + " (Modbus)");
+        Serial.println(">> DECIMAL: " + String(decimalpoint) + " (Modbus)");
     } else {
         Serial.printf(">> MODBUS: Read error: %02X\n", result);
     }
@@ -475,6 +475,19 @@ void sendSensorData() {
         Serial.println(">> HTTP: Failed. Saving to SD...");
         saveDataOffline(String(timeStr), sensorData);
     }
+}
+
+void clearSavedWifi() {
+    preferences.begin("wifi_db", false);
+    if (preferences.clear()) {
+        Serial.println(">> NVS: Wi-Fi credentials cleared.");
+    } else {
+        Serial.println(">> NVS: Failed to clear Wi-Fi.");
+    }
+    preferences.end();
+    
+    // Also clear standard ESP32 WiFi NVS (just in case)
+    WiFi.disconnect(true, true); 
 }
 
 // ================================================================
@@ -537,6 +550,20 @@ class MyCallbacks: public NimBLECharacteristicCallbacks {
                     ? "Connected! SSID: " + WiFi.SSID() + " | IP: " + WiFi.localIP().toString()
                     : "Status: Not Connected";
                 safeNotify(statusMsg);
+            }
+            else if (strcmp(act, "forget_wifi") == 0) {
+                Serial.println(">> CMD: Forget Wi-Fi requested.");
+                
+                // 1. Clear Memory
+                clearSavedWifi();
+                
+                // 2. Notify Phone
+                if(deviceConnected) {
+                    safeNotify("Wi-Fi credentials erased.");
+                }
+                
+                // 3. Disconnect WiFi immediately
+                WiFi.disconnect();
             }
         }
         // Handle config updates
@@ -622,6 +649,12 @@ void setup() {
     Serial.setTimeout(50);
 
     setupSD();
+
+    if (sdReady) {
+        Serial.println("Card type: " + String(SD.cardType()));
+        Serial.println("Card size: " + String(SD.cardSize() / (1024 * 1024)) + " MB");
+    }
+
     delay(500);
 
     Serial.println("\n--- FIRMWARE STARTED (v1.1) ---");
@@ -693,14 +726,14 @@ void setup() {
 // MAIN LOOP
 // ================================================================
 void loop() {
-    // Watchdog (only when not paused and connected)
+    // 1. Watchdog (only when not paused and connected)
     if (deviceConnected && !watchdogPaused && 
         (millis() - lastWatchdogTime > WATCHDOG_TIMEOUT)) {
         Serial.println(">> WATCHDOG: App timeout. Force disconnect.");
         NimBLEDevice::getServer()->disconnect(0);
     }
 
-    // Process offline files periodically
+    // 2. Process offline files (ONLY if connected)
     if (WiFi.status() == WL_CONNECTED && 
         (millis() - lastFileCheckTime > FILE_CHECK_INTERVAL)) {
         lastFileCheckTime = millis();
@@ -710,43 +743,46 @@ void loop() {
         lastWatchdogTime = millis();
     }
 
-    // Data sending logic
-    if (WiFi.status() == WL_CONNECTED) {
-        bool shouldTrigger = false;
+    // 3. SENSOR DATA LOGIC (Runs REGARDLESS of WiFi status)
+    // -----------------------------------------------------
+    bool shouldTrigger = false;
 
-        // MODE 0: Interval (Timer)
-        if (UPDATE_MODE == 0) {
-            if (millis() - lastHttpTime > (UPDATE_INTERVAL * 1000UL)) {
-                shouldTrigger = true;
-                lastHttpTime = millis();
-            }
-        }
-        // MODE 1: Clock Aligned (Cron)
-        else if (UPDATE_MODE == 1) {
-            struct tm timeinfo;
-            if (getLocalTime(&timeinfo)) {
-                int minInterval = UPDATE_INTERVAL / 60;
-                if (minInterval < 1) minInterval = 1;
-
-                if (timeinfo.tm_min % minInterval == 0 && 
-                    timeinfo.tm_min != lastClockMinute) {
-                    shouldTrigger = true;
-                    lastClockMinute = timeinfo.tm_min;
-                }
-            }
-        }
-
-        if (forceHttpNow) {
+    // MODE 0: Interval (Timer)
+    if (UPDATE_MODE == 0) {
+        if (millis() - lastHttpTime > (UPDATE_INTERVAL * 1000UL)) {
             shouldTrigger = true;
-            forceHttpNow = false;
+            lastHttpTime = millis();
         }
+    }
+    // MODE 1: Clock Aligned (Cron)
+    else if (UPDATE_MODE == 1) {
+        struct tm timeinfo;
+        // Only works if we have valid time. 
+        // If offline since boot, year will be 1970, so this logic might fail until RTC is set once.
+        if (getLocalTime(&timeinfo)) {
+            int minInterval = UPDATE_INTERVAL / 60;
+            if (minInterval < 1) minInterval = 1;
 
-        if (shouldTrigger) {
-            sendSensorData();
+            if (timeinfo.tm_min % minInterval == 0 && 
+                timeinfo.tm_min != lastClockMinute) {
+                shouldTrigger = true;
+                lastClockMinute = timeinfo.tm_min;
+            }
         }
     }
 
-    // WiFi scan request
+    if (forceHttpNow) {
+        shouldTrigger = true;
+        forceHttpNow = false;
+    }
+
+    if (shouldTrigger) {
+        // This function handles the "If Connected -> Upload, Else -> SD Card" logic internally
+        sendSensorData();
+    }
+    // -----------------------------------------------------
+
+    // 4. WiFi scan request (From App)
     if (triggerWifiScan) {
         triggerWifiScan = false;
         watchdogPaused = true;
@@ -773,7 +809,7 @@ void loop() {
         lastWatchdogTime = millis();
     }
 
-    // WiFi connection request
+    // 5. WiFi connection request (From App)
     if (wifiConfigReceived) {
         wifiConfigReceived = false;
         watchdogPaused = true;
@@ -808,7 +844,8 @@ void loop() {
         lastWatchdogTime = millis();
     }
 
-    // Auto-reconnect when disconnected
+    // 6. Auto-reconnect when disconnected (Background)
+    // Only runs if NOT connected to App (to prevent interrupting manual config)
     if (WiFi.status() != WL_CONNECTED && !deviceConnected && 
         (millis() - lastWifiCheck > WIFI_RECONNECT_INTERVAL)) {
         lastWifiCheck = millis();
