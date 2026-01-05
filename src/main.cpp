@@ -416,10 +416,10 @@ void sendSensorData() {
 
     if (result == modbus.ku8MBSuccess) {
         uint16_t sensorValue = modbus.getResponseBuffer(0);
-        uint16_t decimalpoint = modbus.getResponseBuffer(1);
-        sensorData = String(sensorValue);
+        // uint16_t decimalpoint = modbus.getResponseBuffer(1);
+        sensorData = String(float(sensorValue)/10.0);
         Serial.println(">> SENSOR: " + sensorData + " (Modbus)");
-        Serial.println(">> DECIMAL: " + String(decimalpoint) + " (Modbus)");
+        // Serial.println(">> DECIMAL: " + String(decimalpoint) + " (Modbus)");
     } else {
         Serial.printf(">> MODBUS: Read error: %02X\n", result);
     }
@@ -607,6 +607,7 @@ class MyCallbacks: public NimBLECharacteristicCallbacks {
                 if (validateSetpoint(sp1)) {
                     setPoint1 = sp1;
                     changed = true;
+                    writeModbusRegister(SET_POINT_1, uint16_t(sp1));
                 } else {
                     safeNotify("Error: Invalid setpoint 1");
                 }
@@ -616,6 +617,7 @@ class MyCallbacks: public NimBLECharacteristicCallbacks {
                 if (validateSetpoint(sp2)) {
                     setPoint2 = sp2;
                     changed = true;
+                    writeModbusRegister(SET_POINT_2, uint16_t(sp2));
                 } else {
                     safeNotify("Error: Invalid setpoint 2");
                 }
