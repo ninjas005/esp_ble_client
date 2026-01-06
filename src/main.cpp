@@ -30,12 +30,12 @@
 #define SD_MISO_PIN 13   // GP13
 
 // Timing Constants
-const unsigned long WATCHDOG_TIMEOUT = 60000;
+const unsigned long WATCHDOG_TIMEOUT = 60000; // 1 minute
 const unsigned long FILE_CHECK_INTERVAL = 900000; // 15 minutes
-const unsigned long WIFI_RECONNECT_INTERVAL = 60000;
-const unsigned long SD_OPERATION_TIMEOUT = 5000;
-const unsigned long HTTP_TIMEOUT = 5000;
-const int WIFI_CONNECT_ATTEMPTS = 20;
+const unsigned long WIFI_RECONNECT_INTERVAL = 60000; // 1 minute
+const unsigned long SD_OPERATION_TIMEOUT = 5000; // 5 seconds
+const unsigned long HTTP_TIMEOUT = 5000; // 5 seconds
+const int WIFI_CONNECT_ATTEMPTS = 20; 
 const int MAX_WIFI_NETWORKS_SAVED = 5;
 const int MAX_SCAN_RESULTS = 15;
 
@@ -350,7 +350,7 @@ bool tryAutoConnect() {
     deserializeJson(doc, savedData);
     JsonArray savedNets = doc.as<JsonArray>();
 
-    // 2. Iterate and Try Connecting BLINDLY (No Scan)
+    // 2. Iterate and Try Connecting BLINDLY (NO SCANNING HERE)
     for (JsonObject obj : savedNets) {
         String ssid = obj["s"].as<String>();
         String pass = obj["p"].as<String>();
@@ -360,10 +360,9 @@ bool tryAutoConnect() {
         WiFi.disconnect();
         WiFi.begin(ssid.c_str(), pass.c_str());
         
-        // Wait up to 5 seconds for connection
-        // This is faster than Scanning (2s) + Connecting (5s)
+        // Wait up to 4 seconds for connection
         int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 10) { // 5 seconds max
+        while (WiFi.status() != WL_CONNECTED && attempts < 8) { 
             delay(500);
             Serial.print(".");
             attempts++;
@@ -390,7 +389,13 @@ void setupTime() {
 void setupModbus() {
     Serial1.begin(9600, SERIAL_8N1, RX1_PIN, TX1_PIN);
     modbus.begin(1, Serial1);
-    Serial.println(">> MODBUS: Initialized (9600 baud)");
+    
+    // --- FIX: LOWER TIMEOUT ---
+    // Default is 2000ms. Set to 200ms. 
+    // If sensor doesn't reply in 200ms, it probably won't reply at all.
+    // modbus.setTimeOut(200); 
+    
+    Serial.println(">> MODBUS: Initialized (9600 baud, 200ms timeout)");
 }
 
 uint8_t writeModbusRegister(uint16_t reg, uint16_t value) {
@@ -503,7 +508,9 @@ class MyServerCallbacks: public NimBLEServerCallbacks {
     void onDisconnect(NimBLEServer* pServer) {
         deviceConnected = false;
         Serial.println(">> EVENT: Phone Disconnected");
+        delay(100); 
         NimBLEDevice::startAdvertising();
+        Serial.println(">> BLE: Advertising Restarted");
     }
 };
 
@@ -513,8 +520,8 @@ class MyCallbacks: public NimBLECharacteristicCallbacks {
         if (value.length() == 0) return;
 
         lastWatchdogTime = millis();
-        Serial.print(">> RAW BLE: ");
-        Serial.println(value.c_str());
+        // Serial.print(">> RAW BLE: ");
+        // Serial.println(value.c_str());
 
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, value);
@@ -564,6 +571,10 @@ class MyCallbacks: public NimBLECharacteristicCallbacks {
                 
                 // 3. Disconnect WiFi immediately
                 WiFi.disconnect();
+            }
+            else if (strcmp(act, "ping") == 0) {
+                // UNCOMMENT THIS TO SEE IF HEARTBEAT IS ARRIVING
+                Serial.print("."); 
             }
         }
         // Handle config updates
@@ -728,7 +739,7 @@ void setup() {
 // MAIN LOOP
 // ================================================================
 void loop() {
-    // 1. Watchdog (only when not paused and connected)
+    // 1. Watchdog
     if (deviceConnected && !watchdogPaused && 
         (millis() - lastWatchdogTime > WATCHDOG_TIMEOUT)) {
         Serial.println(">> WATCHDOG: App timeout. Force disconnect.");
@@ -745,8 +756,9 @@ void loop() {
         lastWatchdogTime = millis();
     }
 
-    // 3. SENSOR DATA LOGIC (Runs REGARDLESS of WiFi status)
-    // -----------------------------------------------------
+    // ============================================================
+    // 3. SENSOR DATA LOGIC (MOVED OUTSIDE WIFI CHECK)
+    // ============================================================
     bool shouldTrigger = false;
 
     // MODE 0: Interval (Timer)
@@ -759,8 +771,6 @@ void loop() {
     // MODE 1: Clock Aligned (Cron)
     else if (UPDATE_MODE == 1) {
         struct tm timeinfo;
-        // Only works if we have valid time. 
-        // If offline since boot, year will be 1970, so this logic might fail until RTC is set once.
         if (getLocalTime(&timeinfo)) {
             int minInterval = UPDATE_INTERVAL / 60;
             if (minInterval < 1) minInterval = 1;
@@ -779,61 +789,49 @@ void loop() {
     }
 
     if (shouldTrigger) {
-        // This function handles the "If Connected -> Upload, Else -> SD Card" logic internally
+        // sendSensorData handles the "If No Wifi -> Save to SD" logic internally
         sendSensorData();
     }
-    // -----------------------------------------------------
+    // ============================================================
 
-    // 4. WiFi scan request (From App)
+    // 4. WiFi scan request
     if (triggerWifiScan) {
         triggerWifiScan = false;
         watchdogPaused = true;
-
         safeNotify("Scanning...");
         WiFi.disconnect();
-
+        // ... (Keep existing scan logic) ...
         int n = WiFi.scanNetworks();
         JsonDocument scanDoc;
         JsonArray array = scanDoc.to<JsonArray>();
-
         for (int i = 0; i < n && i < MAX_SCAN_RESULTS; ++i) {
-            if (WiFi.SSID(i).length() > 0) {
-                array.add(WiFi.SSID(i));
-            }
+            if (WiFi.SSID(i).length() > 0) array.add(WiFi.SSID(i));
         }
-
         String output;
         serializeJson(scanDoc, output);
         safeNotify(output);
-
         WiFi.scanDelete();
         watchdogPaused = false;
         lastWatchdogTime = millis();
     }
 
-    // 5. WiFi connection request (From App)
+    // 5. WiFi connection request
     if (wifiConfigReceived) {
+        // ... (Keep existing connect logic) ...
         wifiConfigReceived = false;
         watchdogPaused = true;
-
         safeNotify("Connecting...");
         WiFi.disconnect();
         WiFi.begin(targetSSID.c_str(), targetPass.c_str());
-
         int attempts = 0;
         while (WiFi.status() != WL_CONNECTED && attempts < WIFI_CONNECT_ATTEMPTS) {
-            delay(500);
-            Serial.print(".");
-            attempts++;
+            delay(500); Serial.print("."); attempts++;
         }
         Serial.println();
-
         if (WiFi.status() == WL_CONNECTED) {
-            String msg = "Connected! SSID: " + WiFi.SSID() + 
-                        " | IP: " + WiFi.localIP().toString();
+            String msg = "Connected! SSID: " + WiFi.SSID() + " | IP: " + WiFi.localIP().toString();
             Serial.println(">> " + msg);
             safeNotify(msg);
-
             saveNetworkToMemory(targetSSID, targetPass);
             setupTime();
             forceHttpNow = true;
@@ -841,13 +839,11 @@ void loop() {
             Serial.println(">> ERROR: WiFi connection failed");
             safeNotify("Connection Failed.");
         }
-
         watchdogPaused = false;
         lastWatchdogTime = millis();
     }
 
-    // 6. Auto-reconnect when disconnected (Background)
-    // Only runs if NOT connected to App (to prevent interrupting manual config)
+    // 6. Auto-reconnect (Background)
     if (WiFi.status() != WL_CONNECTED && !deviceConnected && 
         (millis() - lastWifiCheck > WIFI_RECONNECT_INTERVAL)) {
         lastWifiCheck = millis();
@@ -908,3 +904,6 @@ void loop() {
 //     // Do nothing
 //     delay(1000);
 // }
+
+// ================================================================
+
