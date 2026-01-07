@@ -29,8 +29,10 @@
 #define SD_SCK_PIN  12   // GP12
 #define SD_MISO_PIN 13   // GP13
 
+const int SENSOR_TYPE = 0; // 0 = DPT, 1 = RHT
+
 // Timing Constants
-const unsigned long WATCHDOG_TIMEOUT = 60000; // 1 minute
+const unsigned long WATCHDOG_TIMEOUT = 3000; 
 const unsigned long FILE_CHECK_INTERVAL = 900000; // 15 minutes
 const unsigned long WIFI_RECONNECT_INTERVAL = 60000; // 1 minute
 const unsigned long SD_OPERATION_TIMEOUT = 5000; // 5 seconds
@@ -75,6 +77,9 @@ int lastClockMinute = -1;
 
 String targetSSID = "";
 String targetPass = "";
+
+String DEVICE_NICKNAME = ""; 
+String defaultName = "";
 
 // Config Variables
 String DEVICE_ID = "ESP_001";
@@ -252,6 +257,7 @@ void loadConfig() {
         DeserializationError error = deserializeJson(doc, json);
 
         if (!error) {
+            if(doc.containsKey("name")) DEVICE_NICKNAME = doc["name"].as<String>();
             if (doc.containsKey("id")) DEVICE_ID = doc["id"].as<String>();
             if (doc.containsKey("url")) API_URL = doc["url"].as<String>();
             if (doc.containsKey("ntp")) NTP_SERVER = doc["ntp"].as<String>();
@@ -287,6 +293,7 @@ void loadConfig() {
 void saveConfig() {
     preferences.begin("app_conf", false);
     JsonDocument doc;
+    doc["name"] = DEVICE_NICKNAME; 
     doc["id"] = DEVICE_ID;
     doc["url"] = API_URL;
     doc["ntp"] = NTP_SERVER;
@@ -540,6 +547,8 @@ class MyCallbacks: public NimBLECharacteristicCallbacks {
             }
             else if (strcmp(act, "get_conf") == 0) {
                 JsonDocument resp;
+                resp["name"] = DEVICE_NICKNAME;
+                resp["type"] = SENSOR_TYPE; 
                 resp["id"] = DEVICE_ID;
                 resp["url"] = API_URL;
                 resp["ntp"] = NTP_SERVER;
@@ -578,12 +587,24 @@ class MyCallbacks: public NimBLECharacteristicCallbacks {
             }
         }
         // Handle config updates
-        else if (doc.containsKey("id") || doc.containsKey("url") || 
-                 doc.containsKey("ntp") || doc.containsKey("int") || 
-                 doc.containsKey("mode") || doc.containsKey("sp1") || 
-                 doc.containsKey("sp2")) {
-
+        else if (
+            doc.containsKey("name") ||
+            doc.containsKey("id") || 
+            doc.containsKey("url") || 
+            doc.containsKey("ntp") || 
+            doc.containsKey("int") || 
+            doc.containsKey("mode") || 
+            doc.containsKey("sp1") || 
+            doc.containsKey("sp2") 
+        ) {
             bool changed = false;
+            bool nameChanged = false;
+
+            if(doc.containsKey("name")) { 
+                DEVICE_NICKNAME = doc["name"].as<String>(); 
+                changed = true; 
+                nameChanged = true;
+            }
 
             if (doc.containsKey("id")) {
                 DEVICE_ID = doc["id"].as<String>();
@@ -637,7 +658,14 @@ class MyCallbacks: public NimBLECharacteristicCallbacks {
             if (changed) {
                 saveConfig();
                 forceHttpNow = true;
-                safeNotify("Settings Saved.");
+                // safeNotify("Settings Saved.");
+                if(deviceConnected) {
+                    safeNotify(nameChanged ? "Name Saved. Restarting..." : "Settings Saved.");
+                }
+                if (nameChanged) {
+                    delay(1000);
+                    ESP.restart();
+                }
             }
         }
         // Handle WiFi credentials
@@ -682,15 +710,26 @@ void setup() {
     loadConfig();
     setupModbus();
 
-    // Generate unique device name
+    // Generate Default Name (Original Hardware ID)
     uint64_t mac = ESP.getEfuseMac();
     uint32_t lowBytes = (uint32_t)mac;
-    String devName = "ESP_Setup_" + String(lowBytes, HEX);
-    devName.toUpperCase();
-    Serial.println(">> Device Name: " + devName);
+    defaultName = "ESP_Setup_" + String(lowBytes, HEX);
+    defaultName.toUpperCase();
+
+    loadConfig();
+
+    // Decide which name to use
+    String broadcastName;
+    if (DEVICE_NICKNAME.length() > 0) {
+        broadcastName = DEVICE_NICKNAME;
+    } else {
+        broadcastName = defaultName;
+    }
+    
+    Serial.println(">> Broadcasting Name: " + broadcastName);
 
     // Initialize BLE
-    NimBLEDevice::init(devName.c_str());
+    NimBLEDevice::init(broadcastName.c_str());
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     NimBLEDevice::setMTU(250);
 
@@ -716,7 +755,7 @@ void setup() {
     pAdvertising->addServiceUUID(SERVICE_UUID);
 
     NimBLEAdvertisementData scanResp;
-    scanResp.setName(devName.c_str());
+    scanResp.setName(broadcastName.c_str());
     pAdvertising->setScanResponseData(scanResp);
     pAdvertising->start();
 
